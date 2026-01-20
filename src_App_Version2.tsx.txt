@@ -1,0 +1,337 @@
+```tsx
+import React, { useState, useRef, useEffect } from 'react';
+import { PacketParser } from './services/packetParser';
+import { ThreatDetector } from './services/threatDetector';
+import { StatisticsEngine } from './services/statisticsEngine';
+import { GeoIPMapper } from './services/geoip';
+import { Packet } from './types/security';
+import StreamViewer from './components/StreamViewer';
+import HexViewer from './components/HexViewer';
+import { AlertTriangle, Shield, Activity, FileText } from 'lucide-react';
+import { PieChart, Pie, Cell, Tooltip, BarChart, Bar, XAxis, YAxis } from 'recharts';
+
+export default function App() {
+  const [packets, setPackets] = useState<Packet[]>([]);
+  const [alerts, setAlerts] = useState<any[]>([]);
+  const [stats, setStats] = useState<any | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [activeTab, setActiveTab] = useState<'overview' | 'alerts' | 'packets' | 'forensic'>('overview');
+  const [geoMapper, setGeoMapper] = useState<GeoIPMapper | null>(null);
+  const workerRef = useRef<Worker | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (workerRef.current) {
+        workerRef.current.terminate();
+        workerRef.current = null;
+      }
+    };
+  }, []);
+
+  const spawnWorker = (): Worker => {
+    if (workerRef.current) return workerRef.current;
+    // Vite-compatible worker creation
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const w = new Worker(new URL('./workers/pcapWorker.ts', import.meta.url), { type: 'module' });
+    workerRef.current = w;
+    return w;
+  };
+
+  const handleFileUpload = async (file: File) => {
+    setLoading(true);
+    try {
+      const parser = new PacketParser();
+      let parsed: Packet[] = [];
+
+      // Use worker for large files (> 5MB)
+      if ((file.name.endsWith('.pcap') || file.name.endsWith('.pcapng')) && file.size > 5 * 1024 * 1024) {
+        const buffer = await file.arrayBuffer();
+        const w = spawnWorker();
+        const packetsFromWorker: Packet[] = await new Promise((resolve, reject) => {
+          const onMessage = (e: MessageEvent) => {
+            const msg = e.data;
+            if (msg?.type === 'result') {
+              w.removeEventListener('message', onMessage);
+              resolve(msg.packets);
+            } else if (msg?.type === 'error') {
+              w.removeEventListener('message', onMessage);
+              reject(new Error(msg.message));
+            }
+          };
+          w.addEventListener('message', onMessage);
+          w.postMessage({ buffer }, [buffer]);
+          // fallback timeout
+          setTimeout(() => reject(new Error('Worker parsing timeout')), 120000);
+        });
+        parsed = packetsFromWorker;
+      } else {
+        if (file.name.endsWith('.pcap') || file.name.endsWith('.pcapng')) {
+          const buffer = await file.arrayBuffer();
+          try {
+            parsed = parser.parsePCAP(buffer);
+            if (parsed.length === 0) parsed = parser.parsePCAPNG(buffer);
+          } catch {
+            parsed = parser.parsePCAPNG(buffer);
+          }
+        } else if (file.name.endsWith('.csv')) {
+          const text = await file.text();
+          parsed = parser.parseCSV(text);
+        } else if (file.name.endsWith('.json')) {
+          const text = await file.text();
+          parsed = parser.parseJSON(text);
+        } else {
+          throw new Error('Unsupported file format');
+        }
+      }
+
+      // Normalize objects
+      const normalized = parsed.map((p, i) => ({ ...p, id: p.id ?? `pkt_${i}` }));
+      setPackets(normalized);
+
+      // Threat detection and stats
+      const detector = new ThreatDetector();
+      setAlerts(detector.detectThreats(normalized));
+
+      const statsEngine = new StatisticsEngine();
+      setStats(statsEngine.generateStats(normalized));
+
+      setActiveTab('overview');
+    } catch (err: any) {
+      alert('Error parsing file: ' + (err?.message || String(err)));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleGeoLoad = async (file: File | null) => {
+    if (!file) return;
+    const text = await file.text();
+    const mapper = new GeoIPMapper();
+    mapper.loadFromCSV(text);
+    setGeoMapper(mapper);
+    // Recompute country counts if we have packets
+    if (packets.length) {
+      const counts: Record<string, number> = {};
+      for (const p of packets) {
+        const g = mapper.lookup(p.srcIP) || mapper.lookup(p.dstIP);
+        const code = g?.countryCode ?? 'ZZ';
+        counts[code] = (counts[code] || 0) + 1;
+      }
+      console.log('Country counts', counts);
+    }
+  };
+
+  const severityColors: Record<string, string> = {
+    critical: '#ef4444',
+    high: '#f97316',
+    medium: '#eab308',
+    low: '#3b82f6'
+  };
+
+  return (
+    <div className="min-h-screen bg-slate-950 text-slate-100">
+      <header className="border-b border-cyan-900/50 bg-slate-900/50 backdrop-blur">
+        <div className="container mx-auto px-6 py-4 flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <Shield className="w-8 h-8 text-cyan-400" />
+            <h1 className="text-2xl font-bold">Network Traffic Analyzer</h1>
+          </div>
+          <div className="flex gap-4 items-center">
+            <label className="cursor-pointer px-4 py-2 bg-cyan-600 hover:bg-cyan-700 rounded-lg font-semibold transition">
+              Upload PCAP/CSV/JSON
+              <input
+                type="file"
+                accept=".pcap,.pcapng,.csv,.json"
+                onChange={(e) => e.target.files?.[0] && handleFileUpload(e.target.files[0])}
+                className="hidden"
+              />
+            </label>
+
+            <label className="cursor-pointer px-3 py-2 border border-slate-800 rounded-lg text-sm">
+              Load GeoIP CSV
+              <input
+                type="file"
+                accept=".csv,.txt"
+                onChange={(e) => handleGeoLoad(e.target.files?.[0] ?? null)}
+                className="hidden"
+              />
+            </label>
+          </div>
+        </div>
+      </header>
+
+      {loading && (
+        <div className="flex items-center justify-center h-64">
+          <div className="animate-spin rounded-full h-12 w-12 border-4 border-cyan-500 border-t-transparent"></div>
+        </div>
+      )}
+
+      {!loading && packets.length > 0 && stats && (
+        <main className="container mx-auto px-6 py-8">
+          <div className="flex gap-4 mb-8 border-b border-slate-800">
+            {[
+              { id: 'overview', label: 'Overview', icon: Activity },
+              { id: 'alerts', label: 'Alerts', icon: AlertTriangle },
+              { id: 'packets', label: 'Packets', icon: FileText },
+              { id: 'forensic', label: 'Forensic', icon: FileText }
+            ].map(tab => (
+              <button
+                key={tab.id}
+                onClick={() => setActiveTab(tab.id as any)}
+                className={`flex items-center gap-2 px-4 py-3 border-b-2 transition ${
+                  activeTab === tab.id ? 'border-cyan-500 text-cyan-400' : 'border-transparent text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                <tab.icon className="w-5 h-5" />
+                {tab.label}
+                {tab.id === 'alerts' && alerts.length > 0 && (
+                  <span className="bg-red-500 text-white text-xs px-2 py-0.5 rounded-full">{alerts.length}</span>
+                )}
+              </button>
+            ))}
+          </div>
+
+          {activeTab === 'overview' && (
+            <div className="space-y-8">
+              <div className="grid grid-cols-4 gap-4">
+                <div className="bg-slate-900 border border-slate-800 rounded-lg p-6">
+                  <div className="text-slate-400 text-sm mb-1">Total Packets</div>
+                  <div className="text-3xl font-bold text-cyan-400">{stats.totalPackets.toLocaleString()}</div>
+                </div>
+                <div className="bg-slate-900 border border-slate-800 rounded-lg p-6">
+                  <div className="text-slate-400 text-sm mb-1">Unique IPs</div>
+                  <div className="text-3xl font-bold text-cyan-400">{stats.uniqueIPs}</div>
+                </div>
+                <div className="bg-slate-900 border border-slate-800 rounded-lg p-6">
+                  <div className="text-slate-400 text-sm mb-1">Threats Detected</div>
+                  <div className="text-3xl font-bold text-red-400">{alerts.length}</div>
+                </div>
+                <div className="bg-slate-900 border border-slate-800 rounded-lg p-6">
+                  <div className="text-slate-400 text-sm mb-1">Time Range</div>
+                  <div className="text-lg font-semibold">{Math.round((stats.timeRange.end - stats.timeRange.start) / 60000)}m</div>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 gap-8">
+                <div className="bg-slate-900 border border-slate-800 rounded-lg p-6">
+                  <h3 className="text-lg font-semibold mb-4">Protocol Distribution</h3>
+                  <PieChart width={400} height={300}>
+                    <Pie data={stats.protocolDistribution} dataKey="count" nameKey="protocol" cx="50%" cy="50%" outerRadius={90} label>
+                      {stats.protocolDistribution.map((entry: any, index: number) => (
+                        <Cell key={index} fill={['#06b6d4', '#8b5cf6', '#ec4899', '#f59e0b', '#10b981'][index % 5]} />
+                      ))}
+                    </Pie>
+                    <Tooltip />
+                  </PieChart>
+                </div>
+
+                <div className="bg-slate-900 border border-slate-800 rounded-lg p-6">
+                  <h3 className="text-lg font-semibold mb-4">Top Talkers</h3>
+                  <BarChart width={400} height={300} data={stats.topTalkers.slice(0, 8)}>
+                    <XAxis dataKey="ip" angle={-45} textAnchor="end" height={100} stroke="#64748b" />
+                    <YAxis stroke="#64748b" />
+                    <Tooltip />
+                    <Bar dataKey="bytes" fill="#06b6d4" />
+                  </BarChart>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {activeTab === 'alerts' && (
+            <div className="space-y-4">
+              {alerts.length === 0 ? (
+                <div className="bg-slate-900 border border-slate-800 rounded-lg p-12 text-center">
+                  <Shield className="w-16 h-16 text-green-500 mx-auto mb-4" />
+                  <p className="text-xl text-slate-400">No threats detected</p>
+                </div>
+              ) : (
+                alerts.map((alert: any) => (
+                  <div key={alert.id} className="bg-slate-900 border-l-4 rounded-lg p-6" style={{ borderLeftColor: severityColors[alert.severity] }}>
+                    <div className="flex items-start justify-between mb-3">
+                      <div className="flex items-center gap-3">
+                        <AlertTriangle className="w-6 h-6" style={{ color: severityColors[alert.severity] }} />
+                        <div>
+                          <h3 className="text-lg font-semibold">{alert.description}</h3>
+                          <p className="text-sm text-slate-400">{alert.type.replace('_', ' ').toUpperCase()} • {alert.sourceIP}</p>
+                        </div>
+                      </div>
+                      <span className="px-3 py-1 rounded-full text-xs font-semibold uppercase" style={{ backgroundColor: `${severityColors[alert.severity]}22`, color: severityColors[alert.severity] }}>
+                        {alert.severity}
+                      </span>
+                    </div>
+                    <div className="space-y-1 text-sm text-slate-300">
+                      {alert.evidence.map((ev: string, i: number) => <div key={i}>• {ev}</div>)}
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+          )}
+
+          {activeTab === 'packets' && (
+            <div className="bg-slate-900 border border-slate-800 rounded-lg overflow-hidden">
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead className="bg-slate-800">
+                    <tr>
+                      <th className="px-4 py-3 text-left">Time</th>
+                      <th className="px-4 py-3 text-left">Source</th>
+                      <th className="px-4 py-3 text-left">Destination</th>
+                      <th className="px-4 py-3 text-left">Protocol</th>
+                      <th className="px-4 py-3 text-left">Length</th>
+                      <th className="px-4 py-3 text-left">Flags</th>
+                      <th className="px-4 py-3 text-left">Seq</th>
+                      <th className="px-4 py-3 text-left">Ack</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {packets.slice(0, 500).map((packet, i) => (
+                      <tr key={packet.id ?? i} className="border-t border-slate-800 hover:bg-slate-800/50">
+                        <td className="px-4 py-2">{new Date(packet.timestamp).toLocaleTimeString()}</td>
+                        <td className="px-4 py-2 font-mono text-xs">{packet.srcIP}:{packet.srcPort}</td>
+                        <td className="px-4 py-2 font-mono text-xs">{packet.dstIP}:{packet.dstPort}</td>
+                        <td className="px-4 py-2">
+                          <span className="px-2 py-1 bg-cyan-900/50 text-cyan-300 rounded text-xs">{packet.protocol}</span>
+                        </td>
+                        <td className="px-4 py-2">{packet.length} bytes</td>
+                        <td className="px-4 py-2 text-xs text-slate-400">{packet.flags?.join(', ')}</td>
+                        <td className="px-4 py-2 text-xs">{packet.seq ?? ''}</td>
+                        <td className="px-4 py-2 text-xs">{packet.ack ?? ''}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
+          {activeTab === 'forensic' && (
+            <div>
+              <StreamViewer packets={packets} />
+            </div>
+          )}
+        </main>
+      )}
+
+      {!loading && packets.length === 0 && (
+        <main className="container mx-auto px-6 py-16 text-center">
+          <div className="max-w-2xl mx-auto bg-slate-900 border border-slate-800 rounded-lg p-12">
+            <Shield className="w-16 h-16 text-cyan-400 mx-auto mb-4" />
+            <h2 className="text-xl font-semibold mb-2">Upload a PCAP / CSV / JSON file</h2>
+            <p className="text-slate-400 mb-6">All analysis runs locally in your browser. No data is uploaded anywhere.</p>
+            <div className="flex items-center justify-center gap-4">
+              <label className="cursor-pointer px-4 py-3 bg-cyan-600 hover:bg-cyan-700 rounded-lg font-semibold transition">
+                Select file
+                <input type="file" accept=".pcap,.pcapng,.csv,.json" onChange={(e) => e.target.files?.[0] && handleFileUpload(e.target.files[0])} className="hidden" />
+              </label>
+            </div>
+            <p className="text-xs text-slate-500 mt-6">Tip: Drag & drop a file onto this panel (or use the selector).</p>
+          </div>
+        </main>
+      )}
+    </div>
+  );
+}
+```
+```
